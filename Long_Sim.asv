@@ -1,0 +1,179 @@
+% Longitudinal Vehicle Simulation (Step 2: Static Torque Map)
+clear all
+close all
+clc
+
+%Import Raceline
+raceline = readtable('raceline_cleaned.csv');
+raceline_distance = raceline.distance_m;
+raceline_speed = raceline.speed_mps;
+
+dx = 1.0;  % meters per simulation step (adjustable)
+track_length = max(raceline_distance);
+N = ceil(track_length / dx) + 1;
+
+% Preallocate
+time = zeros(1, N);
+
+% Vehicle parameters
+mass = 800;                % kg
+wheel_radius = 0.35;        % meters
+final_drive = 3.0;
+gear_ratios = [2.917, 1.875, 1.381, 1.115, 0.960, 0.889];
+Cd = 0.858;                   % drag coefficient
+A = 1.0;                    % frontal area [m^2]
+rho = 1.225;                % air density [kg/m^3]
+Cr = 0.015;                 % rolling resistance coefficient
+efficiency = 0.9;           % drivetrain efficiency
+
+% Static engine torque map (at full throttle)
+rpm_map = [1000 2000 3000 4000 5000 6000 7000];
+torque_map = [400 500 600 700 700 650 600];  % way higher values
+idle_torque = 20;
+
+% Initialize variables
+v = zeros(1, N);            % speed [m/s]
+s = zeros(1, N);            % distance [m]
+a = zeros(1, N);            % acceleration [m/s^2]
+rpm = zeros(1, N);          % engine RPM
+gear = ones(1, N);          % start in 1st gear
+T_engine = zeros(1, N);     % engine torque
+
+% Shifting thresholds
+upshift_rpm = 6000;
+downshift_rpm = 2500;
+max_gear = length(gear_ratios);
+
+%Preallocate States:
+v = zeros(1, N);            % speed [m/s]
+s = zeros(1, N);            % distance [m]
+a = zeros(1, N);            % acceleration [m/s^2]
+rpm = zeros(1, N);          % engine RPM
+gear = ones(1, N);          % start in 1st gear
+T_engine = zeros(1, N);     % engine torque
+v_target = zeros(1, N);     % initialize here too
+
+%Intiial Speed and Position
+s(1) = 0;  % or set to raceline start position if offset
+v(1) = interp1(raceline_distance, raceline_speed, s(1));  % realistic starting speed
+
+for i = 1:N-1
+    if s(i) >= track_length
+        break;
+    end
+
+    % --- Current gear and ratio
+    current_gear = gear(i);
+    gear_ratio = gear_ratios(current_gear);
+
+    % --- Compute RPM and clamp to torque map range
+    rpm(i) = (v(i) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
+    rpm(i) = max(min(rpm(i), 7000), 1000);
+
+    % --- Shift logic
+    if rpm(i) > upshift_rpm && current_gear < max_gear
+        current_gear = current_gear + 1;
+    elseif rpm(i) < downshift_rpm && current_gear > 1
+        current_gear = current_gear - 1;
+    end
+    gear(i+1) = current_gear;
+    gear_ratio = gear_ratios(current_gear);  % Update if gear changed
+
+    % --- Target speed and tracking error
+    v_target(i) = interp1(raceline_distance, raceline_speed, s(i), 'linear', 'extrap');
+    v_err = v_target(i) - v(i);
+
+    % --- Throttle and brake control
+    if v_err > 0.5
+        throttle = 1.0; brake = 0.0;
+    elseif v_err < -0.5
+        throttle = 0.0; brake = 1.0;
+    else
+        throttle = 0.3; brake = 0.0;
+    end
+
+    % --- Engine torque
+    T_interp = interp1(rpm_map, torque_map, rpm(i), 'linear', 'extrap');
+    T_engine(i) = throttle * T_interp;
+    if throttle == 0
+        T_engine(i) = idle_torque;
+    end
+
+    % --- Forces
+    F_brake = brake * 5000;
+    T_wheel = T_engine(i) * gear_ratio * final_drive * efficiency;
+    F_trac = T_wheel / wheel_radius;
+    F_drag = 0.5 * rho * Cd * A * v(i)^2;
+    F_roll = Cr * mass * 9.81;
+    F_net = F_trac - F_drag - F_roll - F_brake;
+
+    % --- Acceleration and integration
+    a(i) = F_net / mass;
+    ds = dx;
+    v_avg = max(v(i), 0.1);
+    dt_i = ds / v_avg;
+
+    time(i+1) = time(i) + dt_i;
+    v(i+1) = max(v(i) + a(i) * dt_i, 0);
+    s(i+1) = s(i) + ds;
+
+    % --- Recalculate average velocity and dt for logging (optional)
+    v_avg = (v(i) + v(i+1)) / 2;
+    dt_i = ds / max(v_avg, 0.1);
+
+    % --- Stop condition message
+    if v(i+1) == 0
+        fprintf('Stopped at i=%d, s=%.2f m, time=%.2f s\n', i, s(i), time(i));
+    end
+end
+
+
+fprintf('Lap finished in %.2f seconds over %.1f meters using %d steps.\n', ...
+    time(end), s(end), i);
+
+% --- Interpolate raceline target speed
+raceline = readtable('raceline_cleaned.csv');
+raceline_distance = raceline.distance_m;
+raceline_speed = raceline.speed_mps;
+v_target = interp1(raceline_distance, raceline_speed, s, 'linear', 'extrap');
+
+% --- Truncate vectors to completed lap length
+v          = v(1:i);
+s          = s(1:i);
+a          = a(1:i);
+rpm        = rpm(1:i);
+T_engine   = T_engine(1:i);
+gear       = gear(1:i);
+v_target   = v_target(1:i);
+time       = time(1:i);
+
+% --- Create unified validity mask
+valid_idx = ~isnan(v) & ~isnan(rpm) & ~isnan(T_engine) & ~isnan(time) & (time > 0);
+
+% --- Time-based subplot figure
+figure(1); clf;
+subplot(4,1,1);
+plot(time(valid_idx), v(valid_idx), '-', 'LineWidth', 1.5);
+ylabel('Speed [m/s]'); grid on; axis tight;
+
+subplot(4,1,2);
+plot(time(valid_idx), rpm(valid_idx), '-', 'LineWidth', 1.5);
+ylabel('RPM'); grid on; axis tight;
+
+subplot(4,1,3);
+plot(time(valid_idx), T_engine(valid_idx), '-', 'LineWidth', 1.5);
+ylabel('Engine Torque [Nm]'); grid on; axis tight;
+
+subplot(4,1,4);
+stairs(time(valid_idx), gear(valid_idx), 'LineWidth', 1.5);
+ylabel('Gear'); xlabel('Time [s]'); grid on; axis tight;
+
+% --- Distance-based overlay plot
+figure(2); clf;
+plot(s, v, 'b-', 'LineWidth', 1.5); hold on;
+% plot(s(valid_idx), v_target(valid_idx), 'r--', 'LineWidth', 1.5);
+xlabel('Distance [m]');
+ylabel('Speed [m/s]');
+legend('Simulated', 'Target');
+title('Simulated vs Target Speed');
+grid on; axis tight;
