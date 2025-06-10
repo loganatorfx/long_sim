@@ -4,6 +4,7 @@ close all
 clc
 fprintf('Starting new simulation run...\n');
 
+
 % Import Raceline
 raceline = readtable('raceline_cleaned.csv');
 raceline_distance = raceline.distance_m;
@@ -17,26 +18,17 @@ N = ceil(track_length / dx) + 1;
 % Vehicle parameters
 mass = 800;                      % kg
 wheel_radius = 0.35;            % meters
-final_drive = 3.0;
 gear_ratios = [2.917, 1.875, 1.381, 1.115, 0.960, 0.889];
 Cd = 0.858;                     % drag coefficient
 A = 1.0;                        % frontal area [m^2]
 rho = 1.225;                    % air density [kg/m^3]
 Cr = 0.015;                     % rolling resistance coefficient
 efficiency = 0.9;               % drivetrain efficiency
+final_drive = 3.0;              % final drive ratio
 
 % Gear-specific shift RPM thresholds
 downshift_rpm_thresh = [0,     2000, 2815, 3375, 3785, 3980]; % gear 1 to 6 (lower bounds)
-upshift_rpm_thresh   = [3900,  4500, 4800, 5000, 4800, 600];   % gear 1 to 6 (upper bounds)
-
-% Static engine torque map (at full throttle)
-rpm_map = [1000 2000 3000 4000 5000 6000 7000];
-torque_map = [400 500 600 700 700 650 600];
-idle_torque = 20;
-
-% Shifting thresholds
-upshift_rpm = 6000;
-downshift_rpm = 2500;
+upshift_rpm_thresh   = [3900,  4500, 4800, 5000, 9999, 9999];   % gear 1 to 6 (upper bounds)
 max_gear = length(gear_ratios);
 
 % Preallocate states
@@ -52,65 +44,50 @@ v_target = zeros(1, N);
 % Initial conditions
 s(1) = 0;
 v(1) = interp1(raceline_distance, raceline_speed, s(1), 'linear', 'extrap');
-if isnan(v(1)) || v(1) <= 0
-    v(1) = 10;
-end
+dt = 0.01;
 
 for i = 1:N-1
+
+    %Check For End Of Sim
     if s(i) >= track_length
         fprintf('Reached end of track at i=%d\n', i);
         break;
     end
 
+    %Update Gear and Gear Ratio
     current_gear = gear(i);
     gear_ratio = gear_ratios(current_gear);
 
-    if v(i) > 0.5
-        rpm(i) = (v(i) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
-        rpm(i) = max(min(rpm(i), 7000), 1000);
-    else
-        rpm(i) = 1000;
-    end
+    %Update RPM
+    rpm(i) = compute_rpm(v(i), gear_ratio, final_drive, wheel_radius);
 
-    v_target(i) = interp1(raceline_distance, raceline_speed, s(i), 'linear', 'extrap');
-    if isnan(v_target(i)) || v_target(i) <= 0
-        v_target(i) = 20;
-    end
+    %Velocity Tracking Control 
+    [v_target(i), throttle, brake] = velocity_control(s(i), v(i), raceline_distance, raceline_speed, dt);
 
-    v_err = v_target(i) - v(i);
-    throttle = min(max(0.5 + 0.03 * v_err, 0), 1);
-    brake = max(-0.1 * v_err, 0);
 
-    T_interp = interp1(rpm_map, torque_map, rpm(i), 'linear', 'extrap');
-    T_engine(i) = throttle * T_interp * (throttle > 0) + idle_torque * (throttle == 0);
+    % Polynomial model-based torque prediction (data-driven)
+    T_engine(i) = torque_model(rpm(i), throttle, current_gear);
 
-    T_wheel = T_engine(i) * gear_ratio * final_drive * efficiency;
-    F_trac = T_wheel / wheel_radius;
-    F_drag = 0.5 * rho * Cd * A * v(i)^2;
-    F_roll = Cr * mass * 9.81;
-    F_brake = brake * 5000;
-
-    F_net = F_trac - F_drag - F_roll - F_brake;
+    %Compute Forces
+    [F_net, ~] = compute_forces(T_engine(i), gear_ratio, final_drive, efficiency, ...
+                                wheel_radius, v(i), rho, Cd, A, Cr, mass, brake);
+    %Compute Acceleration
     a(i) = F_net / mass;
 
+    %Find Timestep(sim is dist based)
     v_current = max(v(i), 1.0);
     dt = dx / v_current;
-    dt = max(min(dt, 2.0), 0.01);
+    dt = dt;
 
+    %Update Velocit and Displacement and tim e
     v(i+1) = max(v(i) + a(i) * dt, 0.5);
     s(i+1) = s(i) + dx;
     time(i+1) = time(i) + dt;
 
     next_rpm = (v(i+1) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
 
-    if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear)
-        gear(i+1) = current_gear + 1;
-    elseif current_gear > 1 && next_rpm < downshift_rpm_thresh(current_gear)
-        gear(i+1) = current_gear - 1;
-    else
-        gear(i+1) = current_gear;
-    end
-
+    gear(i+1) = update_gear(current_gear, next_rpm, throttle, ...
+                            upshift_rpm_thresh, downshift_rpm_thresh, max_gear);
 
     if mod(i, 500) == 0 || v(i+1) < 1.0
         fprintf('i=%d: s=%.1fm, v=%.1fm/s, gear=%d, rpm=%.0f, dt=%.3fs\n', ...
@@ -122,11 +99,6 @@ for i = 1:N-1
         break;
     end
 end
-
-dt_check = diff(time);
-non_increasing = find(dt_check <= 0);
-fprintf('Non-increasing time steps: %d\n', length(non_increasing));
-
 
 sim_length = i;
 fprintf('Lap completed in %.2f seconds over %.1f meters\n', time(sim_length), s(sim_length));
@@ -162,8 +134,95 @@ subplot(4,1,2);
 plot(time_uniform, rpm_plot, 'g-'); ylabel('RPM'); grid on;
 
 subplot(4,1,3);
-plot(time_uniform, T_engine_plot, 'm-'); ylabel('Torque [Nm]'); grid on;
+plot(time_uniform, T_engine_plot, 'm-');
+ylabel('Torque [Nm]');
+ylim([0 1500]);
+grid on;
 
 subplot(4,1,4);
 stairs(time_uniform, gear_plot, 'k-'); ylabel('Gear'); xlabel('Time [s]'); grid on;
 
+%%Funcitons%%
+
+%Torque Calc
+function T = torque_model(rpm, throttle, gear)
+    persistent F loaded
+    if isempty(loaded)
+        data = load('torque_interpolant_smoothed.mat');
+        F = data.F;
+        loaded = true;
+    end
+
+    % Clamp inputs to valid range
+    rpm = min(max(rpm, 1000), 7000);
+    throttle = min(max(throttle * 100, 0), 100); % convert to percent
+    gear = round(min(max(gear, 1), 6));
+
+    T = F(gear, throttle, rpm);
+
+    if throttle == 0
+        T = 20;
+    end
+
+    % Clamp torque to non-negative values
+    T = max(T, 0);
+
+    %Two WWheels Making Torque
+    T = 2* T;
+end
+
+%RPM Calc
+function rpm_val = compute_rpm(v, gear_ratio, final_drive, wheel_radius)
+    if v > 0.5
+        rpm_val = (v * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
+        rpm_val = max(min(rpm_val, 7000), 1000);
+    else
+        rpm_val = 1000;
+    end
+end
+
+%Force Calcs
+function [F_net, F_trac] = compute_forces(T_engine, gear_ratio, final_drive, efficiency, ...
+                                          wheel_radius, v, rho, Cd, A, Cr, mass, brake)
+
+    T_wheel = T_engine * gear_ratio * final_drive * efficiency;
+    F_trac = T_wheel / wheel_radius;
+    F_drag = 0.5 * rho * Cd * A * v^2;
+    F_roll = Cr * mass * 9.81;
+    F_brake = brake * 10000;
+
+    F_net = F_trac - F_drag - F_roll - F_brake;
+end
+
+%Velocity Tracking Control 
+function [v_target_i, throttle, brake] = velocity_control(s_i, v_i, raceline_distance, raceline_speed, dt)
+    v_target_i = interp1(raceline_distance, raceline_speed, s_i, 'linear', 'extrap');
+    if isnan(v_target_i) || v_target_i <= 0
+        v_target_i = 20;
+    end
+    v_err = v_target_i - v_i;
+
+    %Tunable PI Control For Velocity Tracking
+    persistent v_err_int
+    if isempty(v_err_int), v_err_int = 0; end
+    
+    v_err_int = v_err_int + v_err * dt;
+    kp = 0.06;
+    ki = 0.03;
+    throttle = min(max(0.5 + kp * v_err + ki * v_err_int, 0), 1);
+
+    brake = max(-0.1 * v_err, 0);
+end
+
+%Gear Shift Logic
+function next_gear = update_gear(current_gear, next_rpm, throttle, ...
+                                  upshift_rpm_thresh, downshift_rpm_thresh, max_gear)
+    skip_upshift = throttle < 0.3;
+    if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear) && ~skip_upshift
+        next_gear = current_gear + 1;
+    elseif current_gear > 1 && next_rpm < downshift_rpm_thresh(current_gear)
+        next_gear = current_gear - 1;
+    else
+        next_gear = current_gear;
+    end
+end
