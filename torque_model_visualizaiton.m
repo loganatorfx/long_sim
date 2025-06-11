@@ -28,7 +28,7 @@ F = griddedInterpolant(GEAR, THROTTLE, RPM, TORQUE, 'linear', 'nearest');
 
 % Plot for each gear
 figure;
-for g = gears'
+for g = 1
     torque_grid = zeros(size(throttle_grid));
     for i = 1:numel(torque_grid)
         t = throttle_grid(i);
@@ -43,7 +43,7 @@ for g = gears'
     % Apply 2D smoothing
     torque_grid = conv2(torque_grid, ones(3)/3, 'same');
 
-    subplot(2,2,g)
+    plot(g)
     surf(rpm_grid, throttle_grid, torque_grid);
     xlabel('RPM'); ylabel('Throttle (%)'); zlabel('Torque [Nm]');
     title(sprintf('Smoothed Torque Surface - Gear %d', g));
