@@ -1,5 +1,4 @@
-% Longitudinal Vehicle Simulation (Step 2: Static Torque Map)
-clear all
+% Longitudinal Vehicle Simulation
 close all
 clc
 fprintf('Starting new simulation run...\n');
@@ -34,6 +33,7 @@ final_drive = 3.0;              % final drive ratio
 downshift_rpm_thresh = [0,    2700, 3800, 4000, 4300, 4700]; % gear 1 to 6 (lower bounds)
 upshift_rpm_thresh   = [5000, 6200, 6200, 6200, 6200, 6950]; % gear 1 to 6 (upper bounds)
 max_gear = length(gear_ratios);
+max_rpm = 7000;
 
 % Preallocate states
 time = zeros(1, N);
@@ -47,14 +47,26 @@ v_target = zeros(1, N);
 a_cmd = zeros(1, N);
 a_lat = zeros(1, N);  % Preallocate lateral acceleration
 
-
 % Initial conditions
 s(1) = 0;
 v(1) = interp1(raceline_distance, raceline_speed, s(1), 'linear', 'extrap');
 dt = 0.01;
 
-for i = 1:N-1
+%Torque Spool up Params 
+T_engine_prev = 0;
+torque_rate_limit = 300;  % Nm/s, tune as needed
 
+% Gear update with lateral acceleration-based gear hold(passive shift)
+lat_thresh = 5.0;  % [m/s²], tune as needed
+
+%Predictive shift Logic
+t_lookahead = 3.0; % seconds
+s_lookahead = 1.0; %Initialization in Meters
+last_predictive_shift_time = -inf;
+predictive_shift_cooldown = 7.0; % seconds
+
+
+for i = 1:N-1
     %Check For End Of Sim
     if s(i) >= track_length
         fprintf('Reached end of track at i=%d\n', i);
@@ -75,6 +87,10 @@ for i = 1:N-1
     % Polynomial model-based torque prediction (data-driven)
     T_engine(i) = torque_model(rpm(i), throttle, current_gear);
 
+    % Limit torque rate of change to prevent sudden spikes
+    T_engine(i) = min(T_engine_prev + torque_rate_limit * dt, T_engine(i));
+    T_engine_prev = T_engine(i);
+
     %Compute Forces
     [F_net, ~] = compute_forces(T_engine(i), gear_ratio, final_drive, efficiency, ...
                                 wheel_radius, v(i), rho, Cd, A, Cr, mass, brake);
@@ -86,35 +102,80 @@ for i = 1:N-1
     dt = dx / v_current;
     dt = dt;
 
-    %Update Velocit and Displacement and tim e
+    %Update Velocity and Displacement and time
     v(i+1) = max(v(i) + a(i) * dt, 0.5);
     s(i+1) = s(i) + dx;
     time(i+1) = time(i) + dt;
 
+    %%Predictive Shift Logic Implementation%%
+    lookahead_steps = round(t_lookahead / dt);
+    i_lookahead = min(i + lookahead_steps, length(time));
+    
+    v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
+    ds_dt = interp1(raceline_distance, raceline_speed, s(i), 'linear', 'extrap');
+    s_lookahead = s(i) + ds_dt * t_lookahead;
+
+    kappa_lookahead = interp1(raceline_distance, raceline_kappa_radpm, s_lookahead, 'linear', 'extrap');
+    a_lat_lookahead = v_lookahead^2 * kappa_lookahead;
+    
+    rpm_lookahead_current = compute_rpm(v_lookahead, gear_ratios(current_gear), final_drive, wheel_radius);
+
+    if current_gear > 1
+        rpm_lookahead_lower = compute_rpm(v_lookahead, gear_ratios(current_gear - 1), final_drive, wheel_radius);
+    else
+        rpm_lookahead_lower = NaN;  % not defined below 1st gear
+    end
+
+    tq_lookahead_current = torque_model(rpm_lookahead_current, throttle, current_gear);
+    
+    if current_gear > 1
+        tq_lookahead_lower = torque_model(rpm_lookahead_lower, throttle, current_gear - 1);
+    else
+        tq_lookahead_lower = NaN;
+    end
+    
+    torque_gain = tq_lookahead_lower - tq_lookahead_current;
+
+    % if mod(i, 100) == 0
+    % fprintf('Torque G%d = %.1f Nm, G%d = %.1f Nm, Δ = %.1f Nm\n', ...
+    %     current_gear, tq_lookahead_current, current_gear-1, tq_lookahead_lower, torque_gain);
+    % end
+
+    predictive_shift = false;
+
+     if current_gear > 1 && ...
+       a_lat_lookahead < lat_thresh && ...
+       torque_gain > 100 && ...
+       rpm_lookahead_lower < max_rpm - 300
+    
+        predictive_shift = true;
+    end
+
     next_rpm = (v(i+1) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
 
-    % Compute lateral acceleration
+    % Compute lateral acceleration right now
     kappa_i = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
-    a_lat(i) = v(i)^2 * kappa_i;
+    a_lat(i) = v_target(i)^2 * kappa_i;
     
-    % Gear update with lateral acceleration-based gear hold
-    lat_thresh = 5.0;  % [m/s²], tune as needed
-    if a_lat(i) > lat_thresh
-        gear(i+1) = gear(i);  % hold current gear in high lateral load
+    %Shift Gears(Passive)
+    gear(i+1) = update_gear(current_gear, next_rpm, throttle, ...
+                        upshift_rpm_thresh, downshift_rpm_thresh, ...
+                        max_gear, a_lat(i), lat_thresh);
+
+    can_shift = (time(i) - last_predictive_shift_time) > predictive_shift_cooldown;
+
+    if predictive_shift && can_shift
+        gear(i+1) = current_gear - 1;
+        last_predictive_shift_time = time(i);
+        fprintf('Predictive downshift: G%d → G%d @ t=%.2fs, ΔTQ = %.1f Nm\n', ...
+            current_gear, current_gear-1, time(i), torque_gain);
     else
         gear(i+1) = update_gear(current_gear, next_rpm, throttle, ...
-                                upshift_rpm_thresh, downshift_rpm_thresh, max_gear);
+                    upshift_rpm_thresh, downshift_rpm_thresh, ...
+                    max_gear, a_lat(i), lat_thresh);
     end
 
-    if mod(i, 500) == 0 || v(i+1) < 1.0
-        fprintf('i=%d: s=%.1fm, v=%.1fm/s, gear=%d, rpm=%.0f, dt=%.3fs\n', ...
-            i, s(i), v(i), current_gear, rpm(i), dt);
-    end
 
-    if time(i+1) > 300
-        fprintf('Simulation timeout at %.1f seconds\n', time(i+1));
-        break;
-    end
 end
 
 sim_length = i;
@@ -131,7 +192,6 @@ gear = gear(1:sim_length);
 v_target = interp1(raceline_distance, raceline_speed, s, 'linear', 'extrap');
 a_lat = a_lat(1:sim_length);
 
-
 % Create uniform time vector for plotting (e.g., every 0.1 s)
 time_uniform = 0:0.1:time(end);
 
@@ -141,9 +201,20 @@ v_target_plot = interp1(time, v_target, time_uniform, 'linear', 'extrap');
 rpm_plot      = interp1(time, rpm, time_uniform, 'linear', 'extrap');
 T_engine_plot = interp1(time, T_engine, time_uniform, 'linear', 'extrap');
 gear_plot     = interp1(time, gear, time_uniform, 'previous', 'extrap');  % piecewise constant
+a_lat_plot = interp1(time, a_lat, time_uniform, 'linear', 'extrap');
 
+% Lateral acceleration plot in its own figure
+figure(2); clf;
+plot(time_uniform, a_lat_plot, 'b-');
+hold on;
+yline(5, 'r--', 'Threshold +5');
+yline(-5, 'r--', 'Threshold -5');
+xlabel('Time [s]');
+ylabel('Lateral Acceleration [m/s^2]');
+title('Lateral Acceleration Over Time');
+grid on;
 
-% Replace time_clean with time_uniform and interpolated data
+% Main performance subplots in figure 1
 figure(1); clf;
 subplot(4,1,1);
 plot(time_uniform, v_plot, 'b-', time_uniform, v_target_plot, 'r--');
@@ -187,7 +258,7 @@ function T = torque_model(rpm, throttle, gear)
     T = max(T, 0);
 
     %Two WWheels Making Torque
-    T = 2* T;
+    T =  2* T;
 end
 
 %RPM Calc
@@ -200,9 +271,16 @@ function rpm_val = compute_rpm(v, gear_ratio, final_drive, wheel_radius)
     end
 end
 
-%Gear Shift Logic
+%Passive Gearshifting
 function next_gear = update_gear(current_gear, next_rpm, throttle, ...
-                                  upshift_rpm_thresh, downshift_rpm_thresh, max_gear)
+                                  upshift_rpm_thresh, downshift_rpm_thresh, ...
+                                  max_gear, a_lat, lat_thresh)
+
+    if abs(a_lat) > lat_thresh
+        next_gear = current_gear;
+        return;
+    end
+
     skip_upshift = throttle < 0.3;
     if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear) && ~skip_upshift
         next_gear = current_gear + 1;
@@ -240,30 +318,40 @@ function [v_target_i, a_cmd, throttle, brake] = velocity_control(s_i, v_i, racel
         a_path_i = 0;
     end
 
-    % Feedforward + Asymmetric Feedback
+        % Gains
     kp_throttle = 0.3;
-    kp_brake = 0.8;
-    k_ff = 0.5;  % feedforward scaling
-
+    kp_brake = 1.0;
+    k_ff_throttle = 0.1;
+    k_ff_brake = 0.2;
+    
     v_err = v_target_i - v_i;
-
+    
+    % Feedback
     if v_err >= 0
         a_fb = kp_throttle * v_err;
     else
         a_fb = kp_brake * v_err;
     end
-
-    a_cmd = k_ff * a_path_i + a_fb;
-
-    % Clamp command acceleration
-    a_cmd = max(min(a_cmd, 4.0), -5.0);
-
-    % Acceleration to throttle/brake
+    
+    % Feedforward
+    if a_path_i >= 0
+        a_ff = k_ff_throttle * a_path_i;
+    else
+        a_ff = k_ff_brake * a_path_i;
+    end
+    
+    % Total command
+    a_cmd = a_fb + a_ff;
+    
+    % Command-to-actuator mapping
     if a_cmd >= 0
-        throttle = min(max(0.5 + a_cmd, 0), 1);
+        throttle = min(max(a_cmd, 0), 1);
         brake = 0;
     else
         throttle = 0;
         brake = min(max(-a_cmd, 0), 1);
     end
+
+
 end
+

@@ -27,8 +27,9 @@ F = griddedInterpolant(GEAR, THROTTLE, RPM, TORQUE, 'linear', 'nearest');
 [throttle_grid, rpm_grid] = meshgrid(0:5:100, 1000:250:7000);
 
 % Plot for each gear
-figure;
-for g = 1
+
+for g = 1:4
+    figure(g);
     torque_grid = zeros(size(throttle_grid));
     for i = 1:numel(torque_grid)
         t = throttle_grid(i);
@@ -57,3 +58,18 @@ for i = 1:length(gears)
     max_torque = max(T.torque(T.gear_bin == g));
     fprintf('  Gear %d: %.1f Nm\n', g, max_torque);
 end
+
+
+gear_id = 3;
+throttle_id = find(throttles == 100);
+
+torque_slice = squeeze(TORQUE(gear_id, throttle_id, :));
+[max_val, max_idx] = max(torque_slice);
+rpm_peak = rpms(max_idx);
+
+% Define a plateau band (e.g. ±5% of max)
+torque_band_thresh = 0.95 * max_val;
+in_band = torque_slice >= torque_band_thresh;
+rpm_band = rpms(in_band);
+
+fprintf('Gear %d: Peak torque band = [%d, %d] RPM\n', gear_id, min(rpm_band), max(rpm_band));
