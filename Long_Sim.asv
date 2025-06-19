@@ -5,7 +5,7 @@ fprintf('Starting new simulation run...\n');
 
 
 % Import Raceline
-raceline = readtable('laguna_seca_cleaned.csv');
+raceline = readtable('lvms_clean.csv');
 raceline_distance = raceline.s_m;
 raceline_speed = raceline.vx_mps;
 raceline_acceleration = raceline.ax_mps2;
@@ -53,7 +53,7 @@ dt = 0.01;
 
 %Torque Spool up Params 
 T_engine_prev = 0;
-torque_rate_limit = 300;  % Nm/s, tune as needed
+torque_rate_limit = 200;  % Nm/s, tune as needed
 
 % Gear update with lateral acceleration-based gear hold(passive shift)
 lat_thresh = 5.0;  % [m/s²], tune as needed
@@ -106,32 +106,32 @@ for i = 1:N-1
     time(i+1) = time(i) + dt;
 
 
-    % % ///////PASSIVE////////
-    % % Predict next RPM
-    % next_rpm = (v(i+1) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
-    % 
-    % % Compute lateral acceleration
-    % kappa_i = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
-    % a_lat(i) = v_target(i)^2 * kappa_i;
-    % 
-    % % Passive Gearshifting logic inline
-    % if abs(a_lat(i)) > lat_thresh
-    %     gear(i+1) = current_gear;
-    % else
-    %     skip_upshift = throttle < 0.3;
-    %     if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear) && ~skip_upshift
-    %         gear(i+1) = current_gear + 1;
-    %     elseif current_gear > 1 && next_rpm < downshift_rpm_thresh(current_gear)
-    %         gear(i+1) = current_gear - 1;
-    %     else
-    %         gear(i+1) = current_gear;
-    %     end
-    % end
-    % % ///////PASSIVE////////
+    % ///////PASSIVE////////
+    % Predict next RPM
+    next_rpm = (v(i+1) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
 
-    % %///////PREDICTIVE////////
+    % Compute lateral acceleration
+    kappa_i = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
+    a_lat(i) = v_target(i)^2 * kappa_i;
+
+    % Passive Gearshifting logic inline
+    if abs(a_lat(i)) > lat_thresh
+        gear(i+1) = current_gear;
+    else
+        skip_upshift = throttle < 0.3;
+        if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear) && ~skip_upshift
+            gear(i+1) = current_gear + 1;
+        elseif current_gear > 1 && next_rpm < downshift_rpm_thresh(current_gear)
+            gear(i+1) = current_gear - 1;
+        else
+            gear(i+1) = current_gear;
+        end
+    end
+    % ///////PASSIVE////////
+
+    % % %///////PREDICTIVE////////
     % % Lookahead parameters
-    % t_lookahead = 2.0;  % seconds
+    % t_lookahead = 1.0;  % seconds
     % s_lookahead = s(i) + v(i) * t_lookahead;
     % min_rpm = 2000;
     % max_rpm = 6800;
@@ -187,17 +187,18 @@ for i = 1:N-1
     % rpm_up_thresh_hyst = upshift_rpm_thresh;
     % rpm_down_thresh_hyst = downshift_rpm_thresh + hyst_margin;
     % 
-    % % fallback passive shift logic
+    % % Passive fallback (current RPM logic)
     % if gear_next == current_gear
-    %     if current_gear < max_gear && rpm(i) > rpm_up_thresh_hyst(current_gear)
+    %     if current_gear < max_gear && rpm(i) > upshift_rpm_thresh(current_gear)
     %         gear_next = current_gear + 1;
-    %     elseif current_gear > 1 && rpm(i) < rpm_down_thresh_hyst(current_gear)
+    %     elseif current_gear > 1 && rpm(i) < downshift_rpm_thresh(current_gear)
     %         gear_next = current_gear - 1;
     %     end
     % end
     % 
+    % 
     % gear(i+1) = gear_next;
-    % %///////PREDICTIVE////////
+    % % %///////PREDICTIVE////////
 
 end
 
