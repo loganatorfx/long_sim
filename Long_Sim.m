@@ -140,19 +140,18 @@ for i = 1:N-1
 
     % %///////PREDICTIVE////////
     % Lookahead parameters
-    t_lookahead = 0.9;  % seconds
+    t_lookahead = 1.2;  % seconds
     s_lookahead = s(i) + v(i) * t_lookahead;
-    min_rpm = 2000;
-    max_rpm = 6800;
-    min_lat_thresh = 1.5;
-    scale_factor = 0.002;
+    min_lat_thresh = 2.0;
+    scale_factor = 0.01;
+    dt_lookahead = 0.1;
+    t_shift_window = 2.5;  % seconds ahead
 
     % Lookahead projections
     v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
     kappa_lookahead = interp1(raceline_distance, raceline_kappa_radpm, s_lookahead, 'linear', 'extrap');
     a_lat_lookahead = v_lookahead^2 * kappa_lookahead;
     lat_thresh = min_lat_thresh + scale_factor * v(i)^2;
-
 
     % Compute future RPMs
     if current_gear < max_gear
@@ -175,8 +174,6 @@ for i = 1:N-1
     if current_gear < max_gear
         will_need_upshift = rpm_future_current > upshift_rpm_thresh(current_gear);
         % Evaluate lateral acceleration block over lookahead horizon
-        dt_lookahead = 0.1;
-        t_shift_window = 2.0;  % seconds ahead
         t_scan = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
         
         shift_blocked_vector = false(size(t_scan));
@@ -289,7 +286,7 @@ plot(time_uniform, rpm_plot, 'g-'); ylabel('RPM'); grid on;
 
 subplot(6,1,3);
 plot(time_uniform, T_wheel_plot, 'm-');
-ylabel('Wheel Torque [Nm]');
+ylabel('Wheel Torque');
 grid on;
 
 subplot(6,1,4); hold on;
@@ -342,58 +339,58 @@ throttle_focus = throttle_plot(idx_focus);
 brake_focus = brake_plot(idx_focus);
 a_lat_focus = a_lat_plot(idx_focus);
 
-figure(3); clf;
-subplot(6,1,1);
-plot(time_focus, v_focus, 'b-', time_focus, v_target_focus, 'r--');
-ylabel('Speed [m/s]'); legend('Simulated', 'Target'); grid on;
-
-subplot(6,1,2);
-plot(time_focus, rpm_focus, 'g-'); ylabel('RPM'); grid on;
-
-subplot(6,1,3);
-plot(time_focus, T_wheel_focus, 'm-');
-ylabel('Wheel Torque [Nm]');
-grid on;
-
-subplot(6,1,4);
-stairs(time_focus, gear_focus, 'k-');
-ylabel('Gear'); grid on;
-
-subplot(6,1,4); hold on;
-y_limits = [min(gear_focus)-0.5, max(gear_focus)+0.5];
-high_lat_mask_focus = abs(a_lat_focus) > 5;
-in_region = false;
-for i = 1:length(high_lat_mask_focus)
-    if high_lat_mask_focus(i) && ~in_region
-        start_idx = i;
-        in_region = true;
-    elseif ~high_lat_mask_focus(i) && in_region
-        end_idx = i - 1;
-        h = fill([time_focus(start_idx) time_focus(end_idx) time_focus(end_idx) time_focus(start_idx)], ...
-                 [y_limits(1) y_limits(1) y_limits(2) y_limits(2)], ...
-                 [1.0 0.7 0.7], 'EdgeColor', 'none', 'FaceAlpha', 0.5);
-        uistack(h, 'bottom');
-        in_region = false;
-    end
-end
-if in_region
-    end_idx = length(high_lat_mask_focus);
-    h = fill([time_focus(start_idx) time_focus(end_idx) time_focus(end_idx) time_focus(start_idx)], ...
-             [y_limits(1) y_limits(1) y_limits(2) y_limits(2)], ...
-             [1.0 0.7 0.7], 'EdgeColor', 'none', 'FaceAlpha', 0.5);
-    uistack(h, 'bottom');
-end
-
-stairs(time_focus, gear_focus, 'k-');
-ylabel('Gear'); grid on;
-
-
-subplot(6,1,5);
-plot(time_focus, throttle_focus, 'c-'); ylabel('Throttle'); grid on;
-
-subplot(6,1,6);
-plot(time_focus, brake_focus, 'r-'); ylabel('Brake'); xlabel('Time [s]'); grid on;
-
+% figure(3); clf;
+% subplot(6,1,1);
+% plot(time_focus, v_focus, 'b-', time_focus, v_target_focus, 'r--');
+% ylabel('Speed [m/s]'); legend('Simulated', 'Target'); grid on;
+% 
+% subplot(6,1,2);
+% plot(time_focus, rpm_focus, 'g-'); ylabel('RPM'); grid on;
+% 
+% subplot(6,1,3);
+% plot(time_focus, T_wheel_focus, 'm-');
+% ylabel('Wheel Torque');
+% grid on;
+% 
+% subplot(6,1,4);
+% stairs(time_focus, gear_focus, 'k-');
+% ylabel('Gear'); grid on;
+% 
+% subplot(6,1,4); hold on;
+% y_limits = [min(gear_focus)-0.5, max(gear_focus)+0.5];
+% high_lat_mask_focus = abs(a_lat_focus) > 5;
+% in_region = false;
+% for i = 1:length(high_lat_mask_focus)
+%     if high_lat_mask_focus(i) && ~in_region
+%         start_idx = i;
+%         in_region = true;
+%     elseif ~high_lat_mask_focus(i) && in_region
+%         end_idx = i - 1;
+%         h = fill([time_focus(start_idx) time_focus(end_idx) time_focus(end_idx) time_focus(start_idx)], ...
+%                  [y_limits(1) y_limits(1) y_limits(2) y_limits(2)], ...
+%                  [1.0 0.7 0.7], 'EdgeColor', 'none', 'FaceAlpha', 0.5);
+%         uistack(h, 'bottom');
+%         in_region = false;
+%     end
+% end
+% if in_region
+%     end_idx = length(high_lat_mask_focus);
+%     h = fill([time_focus(start_idx) time_focus(end_idx) time_focus(end_idx) time_focus(start_idx)], ...
+%              [y_limits(1) y_limits(1) y_limits(2) y_limits(2)], ...
+%              [1.0 0.7 0.7], 'EdgeColor', 'none', 'FaceAlpha', 0.5);
+%     uistack(h, 'bottom');
+% end
+% 
+% stairs(time_focus, gear_focus, 'k-');
+% ylabel('Gear'); grid on;
+% 
+% 
+% subplot(6,1,5);
+% plot(time_focus, throttle_focus, 'c-'); ylabel('Throttle'); grid on;
+% 
+% subplot(6,1,6);
+% plot(time_focus, brake_focus, 'r-'); ylabel('Brake'); xlabel('Time [s]'); grid on;
+% 
 
 
 %%Function Models%%
