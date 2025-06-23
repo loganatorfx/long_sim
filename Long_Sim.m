@@ -60,6 +60,8 @@ lat_thresh = 5.0;  % [m/s²], tune as needed
 throttle_vec = zeros(1, N);
 brake_vec = zeros(1, N);
 
+gear(1) = 4;
+
 
 for i = 1:N-1
     %Check For End Of Sim
@@ -110,117 +112,148 @@ for i = 1:N-1
     brake_vec(i) = brake;
 
 
-    % % ///////PASSIVE////////
-    % % Predict next RPM
-    % next_rpm = (v(i+1) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
-    % 
-    % % Compute lateral acceleration
-    kappa_i = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
-    a_lat(i) = v_target(i)^2 * kappa_i;
-    % 
-    % % Passive Gearshifting logic inline
-    % if abs(a_lat(i)) > lat_thresh
-    %     gear(i+1) = current_gear;
-    % else
-    %     skip_upshift = throttle < 0.3;
-    %     if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear) && ~skip_upshift
-    %         gear(i+1) = current_gear + 1;
-    %     elseif current_gear > 1 && next_rpm < downshift_rpm_thresh(current_gear)
-    %         gear(i+1) = current_gear - 1;
-    %     else
-    %         gear(i+1) = current_gear;
-    %     end
-    % end
-    % % ///////PASSIVE////////
-
-    % %///////PREDICTIVE////////
-    % === Predictive Gearshift Tunables ===
-    t_lookahead        = 2.0;      % seconds, lookahead horizon
-    t_shift_window     = 2.0;      % seconds, additional shift evaluation window
-    dt_lookahead       = 0.1;      % seconds, resolution of lookahead scan
-    max_lat_thresh = 7.0;     % maximum threshold at low speed
-    scale_factor   = 0.0015;  % units: (m/s)^2 to m/s²
-
-    lat_thresh_plot = min_lat_thresh + scale_factor * v_plot.^2;
-    a_lat_future_vec(i) = a_lat_lookahead;  % from main lookahead point
-
-
-    % === Predictive Gearshift Logic ===
+    % --- Predictive Gear Shift (Basic) for dummies ---
+    t_lookahead = 1.5;  % seconds
     s_lookahead = s(i) + v(i) * t_lookahead;
     v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
     kappa_lookahead = interp1(raceline_distance, raceline_kappa_radpm, s_lookahead, 'linear', 'extrap');
-    a_lat_lookahead = v_lookahead^2 * kappa_lookahead;
-    lat_thresh = min_lat_thresh + scale_factor * v(i)^2;
 
-    if current_gear < max_gear
-        rpm_future_current = compute_rpm(v_lookahead, gear_ratios(current_gear), final_drive, wheel_radius);
-        rpm_future_next = compute_rpm(v_lookahead, gear_ratios(current_gear + 1), final_drive, wheel_radius);
+    a_lat_pred = v_lookahead^2 * kappa_lookahead;
+
+
+    base_lat_thresh = 4.0;
+    lat_thresh = base_lat_thresh + 0.0015 * v_lookahead^2;
+
+    rpm_next = compute_rpm(v_lookahead, gear_ratio, final_drive, wheel_radius);
+
+
+    if abs(a_lat_pred) > lat_thresh
+        gear(i+1) = current_gear;
+
+    elseif current_gear < max_gear && rpm_next > upshift_rpm_thresh(current_gear)
+        gear(i+1) = current_gear + 1;
+
+    elseif current_gear > 1 && rpm_next < downshift_rpm_thresh(current_gear)
+
+        gear(i+1) = current_gear - 1;
+
     else
-        rpm_future_current = rpm(i);
-        rpm_future_next = rpm(i);
+        gear(i+1) = current_gear;
     end
 
-    if current_gear > 1
-        rpm_future_prev = compute_rpm(v_lookahead, gear_ratios(current_gear - 1), final_drive, wheel_radius);
+
+    % 
+
+    % ///////PASSIVE////////
+    % Predict next RPM
+    next_rpm = (v(i+1) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
+
+    % Compute lateral acceleration
+    kappa_i = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
+    a_lat(i) = v_target(i)^2 * kappa_i;
+
+    % Passive Gearshifting logic inline
+    if abs(a_lat(i)) > lat_thresh
+        gear(i+1) = current_gear;
     else
-        rpm_future_prev = rpm(i);
-    end
-
-    gear_next = current_gear;
-
-    % Predictive upshift
-    if current_gear < max_gear
-        will_need_upshift = rpm_future_current > upshift_rpm_thresh(current_gear);
-
-        t_scan = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
-        shift_blocked_vector = false(size(t_scan));
-        for k = 1:length(t_scan)
-            s_future = s(i) + v(i) * t_scan(k);
-            v_future = interp1(raceline_distance, raceline_speed, s_future, 'linear', 'extrap');
-            kappa_future = interp1(raceline_distance, raceline_kappa_radpm, s_future, 'linear', 'extrap');
-            a_lat_future = v_future^2 * kappa_future;
-            lat_thresh_k = max_lat_thresh - scale_factor * v_future^2;
-            shift_blocked_vector(k) = abs(a_lat_future) > lat_thresh_k;
-        end
-
-        full_shift_block = any(shift_blocked_vector);
-
-        if will_need_upshift && full_shift_block && rpm(i) > downshift_rpm_thresh(current_gear)
-            gear_next = current_gear + 1;  % early upshift
-        elseif rpm(i) > upshift_rpm_thresh(current_gear) && ...
-               rpm_future_next < upshift_rpm_thresh(current_gear + 1) && ...
-               ~full_shift_block
-            gear_next = current_gear + 1;  % standard upshift
+        skip_upshift = throttle < 0.3;
+        if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear) && ~skip_upshift
+            gear(i+1) = current_gear + 1;
+        elseif current_gear > 1 && next_rpm < downshift_rpm_thresh(current_gear)
+            gear(i+1) = current_gear - 1;
+        else
+            gear(i+1) = current_gear;
         end
     end
+    % % ///////PASSIVE////////
 
-    if current_gear > 1
-        will_need_downshift = rpm_future_current < downshift_rpm_thresh(current_gear);
-    
-        t_scan = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
-        shift_blocked_vector = false(size(t_scan));
-        for k = 1:length(t_scan)
-            s_future = s(i) + v(i) * t_scan(k);
-            v_future = interp1(raceline_distance, raceline_speed, s_future, 'linear', 'extrap');
-            kappa_future = interp1(raceline_distance, raceline_kappa_radpm, s_future, 'linear', 'extrap');
-            a_lat_future = v_future^2 * kappa_future;
-            lat_thresh_k = min_lat_thresh + scale_factor * v_future^2;
-            shift_blocked_vector(k) = abs(a_lat_future) > lat_thresh_k;
-        end
-    
-        shift_blocked_down = any(shift_blocked_vector);
-    
-        if will_need_downshift && shift_blocked_down && rpm(i) < upshift_rpm_thresh(current_gear)
-            gear_next = current_gear - 1;
-        elseif rpm(i) < downshift_rpm_thresh(current_gear) && ...
-               rpm_future_prev > downshift_rpm_thresh(current_gear - 1) && ...
-               ~shift_blocked_down
-            gear_next = current_gear - 1;
-        end
-    end
 
-    
-    gear(i+1) = gear_next;
+    % % %///////PREDICTIVE////////
+    % % === Predictive Gearshift Tunables ===
+    % t_lookahead        = 1.0;      % seconds, lookahead horizon
+    % t_shift_window     = 2.0;      % seconds, additional shift evaluation window
+    % dt_lookahead       = 0.1;      % seconds, resolution of lookahead scan
+    % min_lat_thresh = 2.0;     % maximum threshold at low speed
+    % scale_factor   = 0.0015;  % units: (m/s)^2 to m/s²
+    % 
+    % % === Predictive Gearshift Logic ===
+    % s_lookahead = s(i) + v(i) * t_lookahead;
+    % v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
+    % kappa_lookahead = interp1(raceline_distance, raceline_kappa_radpm, s_lookahead, 'linear', 'extrap');
+    % a_lat_lookahead = v_lookahead^2 * kappa_lookahead;
+    % lat_thresh = min_lat_thresh + scale_factor * v(i)^2;
+    % 
+    % if current_gear < max_gear
+    %     rpm_future_current = compute_rpm(v_lookahead, gear_ratios(current_gear), final_drive, wheel_radius);
+    %     rpm_future_next = compute_rpm(v_lookahead, gear_ratios(current_gear + 1), final_drive, wheel_radius);
+    % else
+    %     rpm_future_current = rpm(i);
+    %     rpm_future_next = rpm(i);
+    % end
+    % 
+    % if current_gear > 1
+    %     rpm_future_prev = compute_rpm(v_lookahead, gear_ratios(current_gear - 1), final_drive, wheel_radius);
+    % else
+    %     rpm_future_prev = rpm(i);
+    % end
+    % 
+    % gear_next = current_gear;
+    % 
+    % % Predictive upshift
+    % if current_gear < max_gear
+    %     will_need_upshift = rpm_future_current > upshift_rpm_thresh(current_gear);
+    % 
+    %     t_scan = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
+    %     shift_blocked_vector = false(size(t_scan));
+    %     for k = 1:length(t_scan)
+    %         s_future = s(i) + v(i) * t_scan(k);
+    %         v_future = interp1(raceline_distance, raceline_speed, s_future, 'linear', 'extrap');
+    %         kappa_future = interp1(raceline_distance, raceline_kappa_radpm, s_future, 'linear', 'extrap');
+    %         a_lat_future = v_future^2 * kappa_future;
+    %         lat_thresh_k = max_lat_thresh - scale_factor * v_future^2;
+    %         shift_blocked_vector(k) = abs(a_lat_future) > lat_thresh_k;
+    %     end
+    % 
+    %     full_shift_block = any(shift_blocked_vector);
+    % 
+    %     if will_need_upshift && full_shift_block && rpm(i) > downshift_rpm_thresh(current_gear)
+    %         gear_next = current_gear + 1;  % early upshift
+    %     elseif rpm(i) > upshift_rpm_thresh(current_gear) && ...
+    %            rpm_future_next < upshift_rpm_thresh(current_gear + 1) && ...
+    %            ~full_shift_block
+    %         gear_next = current_gear + 1;  % standard upshift
+    %     end
+    % end
+    % 
+    % if current_gear > 1
+    %     will_need_downshift = rpm_future_current < downshift_rpm_thresh(current_gear);
+    % 
+    %     t_scan = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
+    %     shift_blocked_vector = false(size(t_scan));
+    %     for k = 1:length(t_scan)
+    %         s_future = s(i) + v(i) * t_scan(k);
+    %         v_future = interp1(raceline_distance, raceline_speed, s_future, 'linear', 'extrap');
+    %         kappa_future = interp1(raceline_distance, raceline_kappa_radpm, s_future, 'linear', 'extrap');
+    %         a_lat_future = v_future^2 * kappa_future;
+    %         lat_thresh_k = min_lat_thresh + scale_factor * v_future^2;
+    %         shift_blocked_vector(k) = abs(a_lat_future) > lat_thresh_k;
+    %     end
+    % 
+    %     shift_blocked_down = any(shift_blocked_vector);
+    % 
+    %     if will_need_downshift && shift_blocked_down && rpm(i) < upshift_rpm_thresh(current_gear)
+    %         gear_next = current_gear - 1;
+    %     elseif rpm(i) < downshift_rpm_thresh(current_gear) && ...
+    %            rpm_future_prev > downshift_rpm_thresh(current_gear - 1) && ...
+    %            ~shift_blocked_down
+    %         gear_next = current_gear - 1;
+    %     end
+    % end
+    % 
+    % 
+    % gear(i+1) = gear_next;
+
+
 
 end
 
@@ -316,96 +349,74 @@ plot(time_uniform, throttle_plot, 'c-'); ylabel('Throttle'); grid on;
 subplot(6,1,6);
 plot(time_uniform, brake_plot, 'r-'); ylabel('Brake'); xlabel('Time [s]'); grid on;
 
-figure(3); clf;
-yyaxis left
-plot(time_uniform, rpm_plot, 'b-'); ylabel('RPM');
-yyaxis right
-stairs(time_uniform, gear_plot, 'k-'); ylabel('Gear');
-xlabel('Time [s]');
-title('RPM and Gear Over Time');
-grid on;
-
-figure(4); clf;
-plot(time_uniform, abs(a_lat_plot), 'b-', 'DisplayName', '|a_{lat}|');
-hold on;
-plot(time_uniform, lat_thresh_plot, 'r--', 'DisplayName', 'Threshold');
-xlabel('Time [s]');
-ylabel('Lateral Acceleration [m/s^2]');
-legend();
-title('Lateral Acceleration vs Threshold');
-grid on;
-
-a_lat_future_plot = interp1(time, a_lat_future_vec, time_uniform, 'linear', 'extrap');
-plot(time_uniform, abs(a_lat_future_plot), 'b-');
-
 
 
 % Focused plot around t = 60s
-% t_center = 60;
-% t_window = 10; % +/- 5 seconds
-% idx_focus = time_uniform >= (t_center - t_window) & time_uniform <= (t_center + t_window);
-% 
-% time_focus = time_uniform(idx_focus);
-% v_focus = v_plot(idx_focus);
-% v_target_focus = v_target_plot(idx_focus);
-% rpm_focus = rpm_plot(idx_focus);
-% T_wheel_focus = T_wheel_plot(idx_focus);
-% gear_focus = gear_plot(idx_focus);
-% throttle_focus = throttle_plot(idx_focus);
-% brake_focus = brake_plot(idx_focus);
-% a_lat_focus = a_lat_plot(idx_focus);
-% 
-% figure(3); clf;
-% subplot(6,1,1);
-% plot(time_focus, v_focus, 'b-', time_focus, v_target_focus, 'r--');
-% ylabel('Speed [m/s]'); legend('Simulated', 'Target'); grid on;
-% 
-% subplot(6,1,2);
-% plot(time_focus, rpm_focus, 'g-'); ylabel('RPM'); grid on;
-% 
-% subplot(6,1,3);
-% plot(time_focus, T_wheel_focus, 'm-');
-% ylabel('Wheel Torque [Nm]');
-% grid on;
-% 
-% subplot(6,1,4);
-% stairs(time_focus, gear_focus, 'k-');
-% ylabel('Gear'); grid on;
-% 
-% subplot(6,1,4); hold on;
-% y_limits = [min(gear_focus)-0.5, max(gear_focus)+0.5];
-% high_lat_mask_focus = abs(a_lat_focus) > 5;
-% in_region = false;
-% for i = 1:length(high_lat_mask_focus)
-%     if high_lat_mask_focus(i) && ~in_region
-%         start_idx = i;
-%         in_region = true;
-%     elseif ~high_lat_mask_focus(i) && in_region
-%         end_idx = i - 1;
-%         h = fill([time_focus(start_idx) time_focus(end_idx) time_focus(end_idx) time_focus(start_idx)], ...
-%                  [y_limits(1) y_limits(1) y_limits(2) y_limits(2)], ...
-%                  [1.0 0.7 0.7], 'EdgeColor', 'none', 'FaceAlpha', 0.5);
-%         uistack(h, 'bottom');
-%         in_region = false;
-%     end
-% end
-% if in_region
-%     end_idx = length(high_lat_mask_focus);
-%     h = fill([time_focus(start_idx) time_focus(end_idx) time_focus(end_idx) time_focus(start_idx)], ...
-%              [y_limits(1) y_limits(1) y_limits(2) y_limits(2)], ...
-%              [1.0 0.7 0.7], 'EdgeColor', 'none', 'FaceAlpha', 0.5);
-%     uistack(h, 'bottom');
-% end
-% 
-% stairs(time_focus, gear_focus, 'k-');
-% ylabel('Gear'); grid on;
-% 
-% 
-% subplot(6,1,5);
-% plot(time_focus, throttle_focus, 'c-'); ylabel('Throttle'); grid on;
-% 
-% subplot(6,1,6);
-% plot(time_focus, brake_focus, 'r-'); ylabel('Brake'); xlabel('Time [s]'); grid on;
+t_center = 60;
+t_window = 10; % +/- 5 seconds
+idx_focus = time_uniform >= (t_center - t_window) & time_uniform <= (t_center + t_window);
+
+time_focus = time_uniform(idx_focus);
+v_focus = v_plot(idx_focus);
+v_target_focus = v_target_plot(idx_focus);
+rpm_focus = rpm_plot(idx_focus);
+T_wheel_focus = T_wheel_plot(idx_focus);
+gear_focus = gear_plot(idx_focus);
+throttle_focus = throttle_plot(idx_focus);
+brake_focus = brake_plot(idx_focus);
+a_lat_focus = a_lat_plot(idx_focus);
+
+figure(3); clf;
+subplot(6,1,1);
+plot(time_focus, v_focus, 'b-', time_focus, v_target_focus, 'r--');
+ylabel('Speed [m/s]'); legend('Simulated', 'Target'); grid on;
+
+subplot(6,1,2);
+plot(time_focus, rpm_focus, 'g-'); ylabel('RPM'); grid on;
+
+subplot(6,1,3);
+plot(time_focus, T_wheel_focus, 'm-');
+ylabel('Wheel Torque [Nm]');
+grid on;
+
+subplot(6,1,4);
+stairs(time_focus, gear_focus, 'k-');
+ylabel('Gear'); grid on;
+
+subplot(6,1,4); hold on;
+y_limits = [min(gear_focus)-0.5, max(gear_focus)+0.5];
+high_lat_mask_focus = abs(a_lat_focus) > 5;
+in_region = false;
+for i = 1:length(high_lat_mask_focus)
+    if high_lat_mask_focus(i) && ~in_region
+        start_idx = i;
+        in_region = true;
+    elseif ~high_lat_mask_focus(i) && in_region
+        end_idx = i - 1;
+        h = fill([time_focus(start_idx) time_focus(end_idx) time_focus(end_idx) time_focus(start_idx)], ...
+                 [y_limits(1) y_limits(1) y_limits(2) y_limits(2)], ...
+                 [1.0 0.7 0.7], 'EdgeColor', 'none', 'FaceAlpha', 0.5);
+        uistack(h, 'bottom');
+        in_region = false;
+    end
+end
+if in_region
+    end_idx = length(high_lat_mask_focus);
+    h = fill([time_focus(start_idx) time_focus(end_idx) time_focus(end_idx) time_focus(start_idx)], ...
+             [y_limits(1) y_limits(1) y_limits(2) y_limits(2)], ...
+             [1.0 0.7 0.7], 'EdgeColor', 'none', 'FaceAlpha', 0.5);
+    uistack(h, 'bottom');
+end
+
+stairs(time_focus, gear_focus, 'k-');
+ylabel('Gear'); grid on;
+
+
+subplot(6,1,5);
+plot(time_focus, throttle_focus, 'c-'); ylabel('Throttle'); grid on;
+
+subplot(6,1,6);
+plot(time_focus, brake_focus, 'r-'); ylabel('Brake'); xlabel('Time [s]'); grid on;
 
 
 
@@ -431,7 +442,7 @@ end
 function rpm_val = compute_rpm(v, gear_ratio, final_drive, wheel_radius)
     if v > 0.5
         rpm_val = (v * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
-        rpm_val = max(min(rpm_val, 7000), 1000);
+        % rpm_val = max(min(rpm_val, 7000), 1000);
     else
         rpm_val = 1000;
     end
