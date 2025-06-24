@@ -65,6 +65,8 @@ gear(1) = 4;
 min_time_between_shifts = 2.0;  % seconds, minimum time between gear shifts
 time_since_last_shift = Inf;  % initialize to large so first shift can happen
 predictive_shift_times = [];  % stores times when predictive shifts occur
+verbose = true;   % Set to false to disable debug printouts
+
 
 
 
@@ -149,16 +151,30 @@ for i = 1:N-1
     dt_lookahead       = 0.1;      % seconds, resolution of lookahead scan
     min_lat_thresh     = 2.0;      % maximum threshold at low speed
     scale_factor       = 0.0015;   % units: (m/s)^2 to m/s²
+
+    % === Block shifting under high current lateral load ===
+    kappa_now = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
+    a_lat_now = v(i)^2 * kappa_now;
     
-    % === Predictive Gearshift Logic ===
-    lat_thresh = min_lat_thresh + scale_factor * v(i)^2;
-    predictive_shift_flag = false;
+    if abs(a_lat_now) > 6
+        gear(i+1) = current_gear;
+        if verbose
+            fprintf("Locked at t=%.2f — current lateral accel too high (%.2f > 5.00)\n", ...
+                time(i), abs(a_lat_now));
+        end
+        continue  % Skip shift logic entirely
+    end
     
     % Predict lookahead conditions
     s_lookahead = s(i) + v(i) * t_lookahead;
     v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
     kappa_lookahead = interp1(raceline_distance, raceline_kappa_radpm, s_lookahead, 'linear', 'extrap');
     future_rpm = (v_lookahead * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
+
+    % === Predictive Gearshift Logic ===
+    lat_thresh = min_lat_thresh + scale_factor * v_lookahead^2;
+    lat_thresh_vec(i) = lat_thresh;
+    predictive_shift_flag = false;
     
     % === Always compute lateral acceleration window ===
     t_eval = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
@@ -173,7 +189,6 @@ for i = 1:N-1
     
     % Store the mean for plotting
     a_lat_lookahead_vec(i) = mean(abs(a_lat_window));
-    lat_thresh_vec(i) = lat_thresh;
     
     % === Step 2: Evaluate conditions
     do_downshift = ...
@@ -354,6 +369,10 @@ gear_focus = gear_plot(idx_focus);
 throttle_focus = throttle_plot(idx_focus);
 brake_focus = brake_plot(idx_focus);
 a_lat_focus = a_lat_plot(idx_focus);
+% Get only the predictive shift events in the zoom window
+in_focus = predictive_shift_times >= (t_center - t_window) & predictive_shift_times <= (t_center + t_window);
+pred_shift_times_focus = predictive_shift_times(in_focus);
+pred_shift_gear_focus  = pred_shift_gear(in_focus);
 
 figure(3); clf;
 subplot(6,1,1);
@@ -415,30 +434,25 @@ pred_shift_lookahead = interp1(time, a_lat_lookahead_vec, predictive_shift_times
 pred_shift_thresh    = interp1(time, lat_thresh_vec, predictive_shift_times, 'linear', 'extrap');
 
 % --- 1: Current lateral acceleration
-subplot(3,1,1); hold on;
+subplot(2,1,1); hold on;
 plot(time_uniform, a_lat_plot, 'b-');
 plot(predictive_shift_times, pred_shift_lat, 'rv', 'MarkerFaceColor', 'r');
 ylabel('a_{lat} [m/s²]');
 title('Current Lateral Acceleration');
 grid on;
 
-% --- 2: Lookahead lateral acceleration
-subplot(3,1,2); hold on;
-plot(time_uniform, a_lat_lookahead_plot, 'm-');
-plot(predictive_shift_times, pred_shift_lookahead, 'rv', 'MarkerSize', 6, 'MarkerFaceColor', 'r');
-ylabel('Lookahead a_{lat} [m/s²]');
-title('Mean Lookahead Lateral Acceleration');
-yline(0, '--k');
+% --- 2: Lookahead a_lat and threshold overlaid
+subplot(2,1,2); hold on;
+plot(time_uniform, a_lat_lookahead_plot, 'm-', 'DisplayName', 'Lookahead a_{lat}');
+plot(time_uniform, lat_thresh_plot, 'k--', 'DisplayName', 'a_{lat} Threshold');
+plot(predictive_shift_times, pred_shift_lookahead, 'rv', 'MarkerSize', 6, ...
+    'MarkerFaceColor', 'r', 'DisplayName', 'Predictive Shift');
+ylabel('a_{lat} [m/s²]');
+xlabel('Time [s]');
+title('Lookahead Lateral Acceleration and Threshold');
+legend('Location', 'best');
 grid on;
 
-% --- 3: Threshold
-subplot(3,1,3); hold on;
-plot(time_uniform, lat_thresh_plot, 'k-', 'LineWidth', 1.2);
-plot(predictive_shift_times, pred_shift_thresh, 'rv', 'MarkerFaceColor', 'r');
-ylabel('a_{lat} Threshold');
-xlabel('Time [s]');
-title('Lateral Acceleration Threshold');
-grid on;
 
 
 

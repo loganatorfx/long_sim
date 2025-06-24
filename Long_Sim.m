@@ -65,6 +65,8 @@ gear(1) = 4;
 min_time_between_shifts = 2.0;  % seconds, minimum time between gear shifts
 time_since_last_shift = Inf;  % initialize to large so first shift can happen
 predictive_shift_times = [];  % stores times when predictive shifts occur
+verbose = true;   % Set to false to disable debug printouts
+
 
 
 
@@ -149,7 +151,21 @@ for i = 1:N-1
     dt_lookahead       = 0.1;      % seconds, resolution of lookahead scan
     min_lat_thresh     = 2.0;      % maximum threshold at low speed
     scale_factor       = 0.0015;   % units: (m/s)^2 to m/s²
+
+    % === Block shifting under high current lateral load ===
+    kappa_now = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
+    a_lat_now = v(i)^2 * kappa_now;
+    a_lat(i) = a_lat_now;  % <-- Always store a_lat
     
+    if abs(a_lat_now) > 6
+        gear(i+1) = current_gear;
+        if verbose
+            fprintf("Locked at t=%.2f — current lateral accel too high (%.2f > 5.00)\n", ...
+                time(i), abs(a_lat_now));
+        end
+        continue;
+    end
+
     % Predict lookahead conditions
     s_lookahead = s(i) + v(i) * t_lookahead;
     v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
@@ -274,6 +290,10 @@ pred_shift_gear = interp1(time, gear, predictive_shift_times, 'previous', 'extra
 a_lat_lookahead_vec = a_lat_lookahead_vec(1:sim_length);
 a_lat_lookahead_plot = interp1(time, a_lat_lookahead_vec, time_uniform, 'linear', 'extrap');
 lat_thresh_plot      = interp1(time, lat_thresh_vec, time_uniform, 'linear', 'extrap');
+% Interpolate RPM thresholds for each timestep based on current gear
+downshift_rpm_plot = interp1(1:max_gear, downshift_rpm_thresh, gear_plot, 'linear', 'extrap');
+upshift_rpm_plot   = interp1(1:max_gear, upshift_rpm_thresh,   gear_plot, 'linear', 'extrap');
+
 
 % Lateral acceleration plot in its own figure
 figure(2); clf;
@@ -293,8 +313,11 @@ ylabel('Speed [m/s]'); legend('Simulated', 'Target'); grid on;
 
 subplot(6,1,2);
 plot(time_uniform, rpm_plot, 'g-'); hold on;
-plot(predictive_shift_times, pred_shift_rpm, 'rv', 'MarkerSize', 6, 'MarkerFaceColor', 'r'); % red downward triangle
+plot(time_uniform, downshift_rpm_plot, 'k--', 'DisplayName', 'Downshift Threshold');
+plot(time_uniform, upshift_rpm_plot,   'k--', 'DisplayName', 'Upshift Threshold');
+plot(predictive_shift_times, pred_shift_rpm, 'rv', 'MarkerSize', 6, 'MarkerFaceColor', 'r'); % predictive shift marker
 ylabel('RPM'); grid on;
+legend('RPM', 'Downshift Threshold', 'Upshift Threshold', 'Predictive Shift', 'Location', 'best');
 
 subplot(6,1,3);
 plot(time_uniform, T_wheel_plot, 'm-');
@@ -354,6 +377,10 @@ gear_focus = gear_plot(idx_focus);
 throttle_focus = throttle_plot(idx_focus);
 brake_focus = brake_plot(idx_focus);
 a_lat_focus = a_lat_plot(idx_focus);
+% Get only the predictive shift events in the zoom window
+in_focus = predictive_shift_times >= (t_center - t_window) & predictive_shift_times <= (t_center + t_window);
+pred_shift_times_focus = predictive_shift_times(in_focus);
+pred_shift_gear_focus  = pred_shift_gear(in_focus);
 
 figure(3); clf;
 subplot(6,1,1);
