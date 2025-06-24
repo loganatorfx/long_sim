@@ -111,147 +111,97 @@ for i = 1:N-1
     throttle_vec(i) = throttle;
     brake_vec(i) = brake;
 
+    % % ///////PASSIVE////////
+    % % Predict next RPM
+    % next_rpm = (v(i+1) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
+    % 
+    % % Compute lateral acceleration
+    % kappa_i = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
+    % a_lat(i) = v_target(i)^2 * kappa_i;
+    % 
+    % % Passive Gearshifting logic inline
+    % if abs(a_lat(i)) > lat_thresh
+    %     gear(i+1) = current_gear;
+    % else
+    %     skip_upshift = throttle < 0.3;
+    %     if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear) && ~skip_upshift
+    %         gear(i+1) = current_gear + 1;
+    %     elseif current_gear > 1 && next_rpm < downshift_rpm_thresh(current_gear)
+    %         gear(i+1) = current_gear - 1;
+    %     else
+    %         gear(i+1) = current_gear;
+    %     end
+    % end
+    % % % ///////PASSIVE////////
 
-    % --- Predictive Gear Shift (Basic) for dummies ---
-    t_lookahead = 1.5;  % seconds
+    % /////////PREDICTIVE//////////
+    t_lookahead        = 0.9;      % seconds, lookahead horizon
+    t_shift_window     = 0.5;      % seconds, additional shift evaluation window
+    dt_lookahead       = 0.1;      % seconds, resolution of lookahead scan
+    min_lat_thresh = 2.0;     % maximum threshold at low speed
+    scale_factor   = 0.0015;  % units: (m/s)^2 to m/s²
+
+    % === Predictive Gearshift Logic ===
     s_lookahead = s(i) + v(i) * t_lookahead;
     v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
     kappa_lookahead = interp1(raceline_distance, raceline_kappa_radpm, s_lookahead, 'linear', 'extrap');
-
-    a_lat_pred = v_lookahead^2 * kappa_lookahead;
-
-
-    base_lat_thresh = 4.0;
-    lat_thresh = base_lat_thresh + 0.0015 * v_lookahead^2;
-
-    rpm_next = compute_rpm(v_lookahead, gear_ratio, final_drive, wheel_radius);
-
-
-    if abs(a_lat_pred) > lat_thresh
-        gear(i+1) = current_gear;
-
-    elseif current_gear < max_gear && rpm_next > upshift_rpm_thresh(current_gear)
-        gear(i+1) = current_gear + 1;
-
-    elseif current_gear > 1 && rpm_next < downshift_rpm_thresh(current_gear)
-
-        gear(i+1) = current_gear - 1;
-
-    else
-        gear(i+1) = current_gear;
-    end
-
-
-    % 
-
-    % ///////PASSIVE////////
-    % Predict next RPM
-    next_rpm = (v(i+1) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
-
-    % Compute lateral acceleration
-    kappa_i = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
-    a_lat(i) = v_target(i)^2 * kappa_i;
-
-    % Passive Gearshifting logic inline
-    if abs(a_lat(i)) > lat_thresh
-        gear(i+1) = current_gear;
-    else
-        skip_upshift = throttle < 0.3;
-        if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear) && ~skip_upshift
-            gear(i+1) = current_gear + 1;
-        elseif current_gear > 1 && next_rpm < downshift_rpm_thresh(current_gear)
+    a_lat_lookahead = v_lookahead^2 * kappa_lookahead;
+    lat_thresh = min_lat_thresh + scale_factor * v(i)^2;
+    predictive_shift_flag = false;
+    
+    % Step 1: Predict when downshift will be required
+    s_lookahead = s(i) + v(i) * t_lookahead;
+    v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
+    future_rpm = (v_lookahead * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
+    
+    % Step 2: Check if downshift is expected at that point
+    if current_gear > 1 && future_rpm < downshift_rpm_thresh(current_gear)
+    
+        % Step 3: Evaluate lateral accel over time window [t_lookahead, t_lookahead + t_shift_window]
+        t_eval = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
+        a_lat_window = zeros(size(t_eval));
+    
+        for j = 1:length(t_eval)
+            s_eval = s(i) + v(i) * t_eval(j);
+            v_eval = interp1(raceline_distance, raceline_speed, s_eval, 'linear', 'extrap');
+            kappa_eval = interp1(raceline_distance, raceline_kappa_radpm, s_eval, 'linear', 'extrap');
+            a_lat_window(j) = v_eval^2 * kappa_eval;
+        end
+    
+        % Step 4: Compute lateral accel threshold at current speed
+        lat_thresh = min_lat_thresh + scale_factor * v(i)^2;
+    
+        % Step 5: If all lateral accelerations exceed threshold, shift now
+        if all(abs(a_lat_window) > lat_thresh)
             gear(i+1) = current_gear - 1;
-        else
-            gear(i+1) = current_gear;
+            predictive_shift_flag = true;
         end
     end
-    % % ///////PASSIVE////////
 
+    if ~predictive_shift_flag
+        % Predict next RPM at next timestep
+        next_rpm = (v(i+1) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
+    
+        % Compute lateral acceleration now
+        kappa_i = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
+        a_lat(i) = v_target(i)^2 * kappa_i;
+    
+        % Passive shifting logic
+        if abs(a_lat(i)) > lat_thresh
+            gear(i+1) = current_gear;
+        else
+            skip_upshift = throttle < 0.3;
+            if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear) && ~skip_upshift
+                gear(i+1) = current_gear + 1;
+            elseif current_gear > 1 && next_rpm < downshift_rpm_thresh(current_gear)
+                gear(i+1) = current_gear - 1;
+            else
+                gear(i+1) = current_gear;
+            end
+        end
+    end
 
-    % % %///////PREDICTIVE////////
-    % % === Predictive Gearshift Tunables ===
-    % t_lookahead        = 1.0;      % seconds, lookahead horizon
-    % t_shift_window     = 2.0;      % seconds, additional shift evaluation window
-    % dt_lookahead       = 0.1;      % seconds, resolution of lookahead scan
-    % min_lat_thresh = 2.0;     % maximum threshold at low speed
-    % scale_factor   = 0.0015;  % units: (m/s)^2 to m/s²
-    % 
-    % % === Predictive Gearshift Logic ===
-    % s_lookahead = s(i) + v(i) * t_lookahead;
-    % v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
-    % kappa_lookahead = interp1(raceline_distance, raceline_kappa_radpm, s_lookahead, 'linear', 'extrap');
-    % a_lat_lookahead = v_lookahead^2 * kappa_lookahead;
-    % lat_thresh = min_lat_thresh + scale_factor * v(i)^2;
-    % 
-    % if current_gear < max_gear
-    %     rpm_future_current = compute_rpm(v_lookahead, gear_ratios(current_gear), final_drive, wheel_radius);
-    %     rpm_future_next = compute_rpm(v_lookahead, gear_ratios(current_gear + 1), final_drive, wheel_radius);
-    % else
-    %     rpm_future_current = rpm(i);
-    %     rpm_future_next = rpm(i);
-    % end
-    % 
-    % if current_gear > 1
-    %     rpm_future_prev = compute_rpm(v_lookahead, gear_ratios(current_gear - 1), final_drive, wheel_radius);
-    % else
-    %     rpm_future_prev = rpm(i);
-    % end
-    % 
-    % gear_next = current_gear;
-    % 
-    % % Predictive upshift
-    % if current_gear < max_gear
-    %     will_need_upshift = rpm_future_current > upshift_rpm_thresh(current_gear);
-    % 
-    %     t_scan = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
-    %     shift_blocked_vector = false(size(t_scan));
-    %     for k = 1:length(t_scan)
-    %         s_future = s(i) + v(i) * t_scan(k);
-    %         v_future = interp1(raceline_distance, raceline_speed, s_future, 'linear', 'extrap');
-    %         kappa_future = interp1(raceline_distance, raceline_kappa_radpm, s_future, 'linear', 'extrap');
-    %         a_lat_future = v_future^2 * kappa_future;
-    %         lat_thresh_k = max_lat_thresh - scale_factor * v_future^2;
-    %         shift_blocked_vector(k) = abs(a_lat_future) > lat_thresh_k;
-    %     end
-    % 
-    %     full_shift_block = any(shift_blocked_vector);
-    % 
-    %     if will_need_upshift && full_shift_block && rpm(i) > downshift_rpm_thresh(current_gear)
-    %         gear_next = current_gear + 1;  % early upshift
-    %     elseif rpm(i) > upshift_rpm_thresh(current_gear) && ...
-    %            rpm_future_next < upshift_rpm_thresh(current_gear + 1) && ...
-    %            ~full_shift_block
-    %         gear_next = current_gear + 1;  % standard upshift
-    %     end
-    % end
-    % 
-    % if current_gear > 1
-    %     will_need_downshift = rpm_future_current < downshift_rpm_thresh(current_gear);
-    % 
-    %     t_scan = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
-    %     shift_blocked_vector = false(size(t_scan));
-    %     for k = 1:length(t_scan)
-    %         s_future = s(i) + v(i) * t_scan(k);
-    %         v_future = interp1(raceline_distance, raceline_speed, s_future, 'linear', 'extrap');
-    %         kappa_future = interp1(raceline_distance, raceline_kappa_radpm, s_future, 'linear', 'extrap');
-    %         a_lat_future = v_future^2 * kappa_future;
-    %         lat_thresh_k = min_lat_thresh + scale_factor * v_future^2;
-    %         shift_blocked_vector(k) = abs(a_lat_future) > lat_thresh_k;
-    %     end
-    % 
-    %     shift_blocked_down = any(shift_blocked_vector);
-    % 
-    %     if will_need_downshift && shift_blocked_down && rpm(i) < upshift_rpm_thresh(current_gear)
-    %         gear_next = current_gear - 1;
-    %     elseif rpm(i) < downshift_rpm_thresh(current_gear) && ...
-    %            rpm_future_prev > downshift_rpm_thresh(current_gear - 1) && ...
-    %            ~shift_blocked_down
-    %         gear_next = current_gear - 1;
-    %     end
-    % end
-    % 
-    % 
-    % gear(i+1) = gear_next;
+    %//////////PREDICTIVE/////////////
 
 
 
