@@ -62,8 +62,17 @@ brake_vec = zeros(1, N);
 
 gear(1) = 4;
 
+min_time_between_shifts = 2.0;  % seconds, minimum time between gear shifts
+time_since_last_shift = Inf;  % initialize to large so first shift can happen
+predictive_shift_times = [];  % stores times when predictive shifts occur
+
+
 
 for i = 1:N-1
+    %Shift Timing
+    time_since_last_shift = time_since_last_shift + dt;
+
+
     %Check For End Of Sim
     if s(i) >= track_length
         fprintf('Reached end of track at i=%d\n', i);
@@ -138,45 +147,62 @@ for i = 1:N-1
     t_lookahead        = 0.9;      % seconds, lookahead horizon
     t_shift_window     = 0.5;      % seconds, additional shift evaluation window
     dt_lookahead       = 0.1;      % seconds, resolution of lookahead scan
-    min_lat_thresh = 2.0;     % maximum threshold at low speed
-    scale_factor   = 0.0015;  % units: (m/s)^2 to m/s²
-
-    % === Predictive Gearshift Logic ===
+    min_lat_thresh     = 2.0;      % maximum threshold at low speed
+    scale_factor       = 0.0015;   % units: (m/s)^2 to m/s²
+    
+    % Predict lookahead conditions
     s_lookahead = s(i) + v(i) * t_lookahead;
     v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
     kappa_lookahead = interp1(raceline_distance, raceline_kappa_radpm, s_lookahead, 'linear', 'extrap');
-    a_lat_lookahead = v_lookahead^2 * kappa_lookahead;
-    lat_thresh = min_lat_thresh + scale_factor * v(i)^2;
+    future_rpm = (v_lookahead * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
+
+    % === Predictive Gearshift Logic ===
+    lat_thresh = min_lat_thresh + scale_factor * v_lookahead^2;
+    lat_thresh_vec(i) = lat_thresh;
     predictive_shift_flag = false;
     
-    % Step 1: Predict when downshift will be required
-    s_lookahead = s(i) + v(i) * t_lookahead;
-    v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
-    future_rpm = (v_lookahead * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
+    % === Always compute lateral acceleration window ===
+    t_eval = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
+    a_lat_window = zeros(size(t_eval));
     
-    % Step 2: Check if downshift is expected at that point
-    if current_gear > 1 && future_rpm < downshift_rpm_thresh(current_gear)
+    for j = 1:length(t_eval)
+        s_eval = s(i) + v(i) * t_eval(j);
+        v_eval = interp1(raceline_distance, raceline_speed, s_eval, 'linear', 'extrap');
+        kappa_eval = interp1(raceline_distance, raceline_kappa_radpm, s_eval, 'linear', 'extrap');
+        a_lat_window(j) = v_eval^2 * kappa_eval;
+    end
     
-        % Step 3: Evaluate lateral accel over time window [t_lookahead, t_lookahead + t_shift_window]
-        t_eval = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
-        a_lat_window = zeros(size(t_eval));
+    % Store the mean for plotting
+    a_lat_lookahead_vec(i) = mean(abs(a_lat_window));
     
-        for j = 1:length(t_eval)
-            s_eval = s(i) + v(i) * t_eval(j);
-            v_eval = interp1(raceline_distance, raceline_speed, s_eval, 'linear', 'extrap');
-            kappa_eval = interp1(raceline_distance, raceline_kappa_radpm, s_eval, 'linear', 'extrap');
-            a_lat_window(j) = v_eval^2 * kappa_eval;
-        end
+    % === Step 2: Evaluate conditions
+    do_downshift = ...
+        current_gear > 1 && ...
+        future_rpm < downshift_rpm_thresh(current_gear) && ...
+        time_since_last_shift >= min_time_between_shifts;
     
-        % Step 4: Compute lateral accel threshold at current speed
-        lat_thresh = min_lat_thresh + scale_factor * v(i)^2;
+    lat_ok = all(abs(a_lat_window) > lat_thresh);
     
-        % Step 5: If all lateral accelerations exceed threshold, shift now
-        if all(abs(a_lat_window) > lat_thresh)
-            gear(i+1) = current_gear - 1;
-            predictive_shift_flag = true;
+    % === Step 3: Trigger predictive shift if all criteria met
+    if do_downshift && lat_ok
+        gear(i+1) = current_gear - 1;
+        predictive_shift_flag = true;
+        time_since_last_shift = 0;
+        predictive_shift_times(end+1) = time(i);
+    
+        % Debug
+        fprintf("Predictive shift at t=%.2f | gear=%d → %d | rpm=%.0f | lat_thresh=%.2f | min_window=%.2f\n", ...
+            time(i), current_gear, current_gear - 1, future_rpm, lat_thresh, min(abs(a_lat_window)));
+    else
+        gear(i+1) = current_gear;
+    
+        % Optional: print why it didn't happen
+        if do_downshift && ~lat_ok
+            fprintf("Blocked at t=%.2f — lateral window didn't clear threshold (min=%.2f < %.2f)\n", ...
+                time(i), min(abs(a_lat_window)), lat_thresh);
         end
     end
+
 
     if ~predictive_shift_flag
         % Predict next RPM at next timestep
@@ -184,22 +210,26 @@ for i = 1:N-1
     
         % Compute lateral acceleration now
         kappa_i = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
-        a_lat(i) = v_target(i)^2 * kappa_i;
+        % a_lat(i) = v_target(i)^2 * kappa_i;
     
-        % Passive shifting logic
-        if abs(a_lat(i)) > lat_thresh
+        % Passive shifting logic with time gating
+        if abs(a_lat(i)) > lat_thresh || time_since_last_shift < min_time_between_shifts
             gear(i+1) = current_gear;
+            a_lat(i) = v_target(i)^2 * kappa_i;
         else
             skip_upshift = throttle < 0.3;
             if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear) && ~skip_upshift
                 gear(i+1) = current_gear + 1;
+                time_since_last_shift = 0;
             elseif current_gear > 1 && next_rpm < downshift_rpm_thresh(current_gear)
                 gear(i+1) = current_gear - 1;
+                time_since_last_shift = 0;
             else
                 gear(i+1) = current_gear;
             end
         end
     end
+
 
     %//////////PREDICTIVE/////////////
 
@@ -223,6 +253,8 @@ a_lat = a_lat(1:sim_length);
 throttle_vec = throttle_vec(1:sim_length);
 brake_vec = brake_vec(1:sim_length);
 T_wheel = T_wheel(1:sim_length);
+a_lat_lookahead_vec = a_lat_lookahead_vec(1:sim_length);
+lat_thresh_vec = lat_thresh_vec(1:sim_length);
 
 % Create uniform time vector for plotting (e.g., every 0.1 s)
 time_uniform = 0:0.1:time(end);
@@ -237,8 +269,11 @@ a_lat_plot = interp1(time, a_lat, time_uniform, 'linear', 'extrap');
 throttle_plot = interp1(time, throttle_vec, time_uniform, 'linear', 'extrap');
 brake_plot    = interp1(time, brake_vec,    time_uniform, 'linear', 'extrap');
 T_wheel_plot = interp1(time, T_wheel, time_uniform, 'linear', 'extrap');
-
-
+pred_shift_rpm = interp1(time, rpm, predictive_shift_times, 'linear', 'extrap');
+pred_shift_gear = interp1(time, gear, predictive_shift_times, 'previous', 'extrap');
+a_lat_lookahead_vec = a_lat_lookahead_vec(1:sim_length);
+a_lat_lookahead_plot = interp1(time, a_lat_lookahead_vec, time_uniform, 'linear', 'extrap');
+lat_thresh_plot      = interp1(time, lat_thresh_vec, time_uniform, 'linear', 'extrap');
 
 % Lateral acceleration plot in its own figure
 figure(2); clf;
@@ -257,7 +292,9 @@ plot(time_uniform, v_plot, 'b-', time_uniform, v_target_plot, 'r--');
 ylabel('Speed [m/s]'); legend('Simulated', 'Target'); grid on;
 
 subplot(6,1,2);
-plot(time_uniform, rpm_plot, 'g-'); ylabel('RPM'); grid on;
+plot(time_uniform, rpm_plot, 'g-'); hold on;
+plot(predictive_shift_times, pred_shift_rpm, 'rv', 'MarkerSize', 6, 'MarkerFaceColor', 'r'); % red downward triangle
+ylabel('RPM'); grid on;
 
 subplot(6,1,3);
 plot(time_uniform, T_wheel_plot, 'm-');
@@ -289,7 +326,9 @@ if in_region
     uistack(h, 'bottom');
 end
 
-stairs(time_uniform, gear_plot, 'k-');
+
+stairs(time_uniform, gear_plot, 'k-'); hold on;
+plot(predictive_shift_times, pred_shift_gear, 'rv', 'MarkerSize', 6, 'MarkerFaceColor', 'r'); % red triangle
 ylabel('Gear');
 grid on;
 
@@ -367,6 +406,35 @@ plot(time_focus, throttle_focus, 'c-'); ylabel('Throttle'); grid on;
 
 subplot(6,1,6);
 plot(time_focus, brake_focus, 'r-'); ylabel('Brake'); xlabel('Time [s]'); grid on;
+
+figure(4); clf;
+
+% Shared predictive shift marker data
+pred_shift_lat       = interp1(time, a_lat, predictive_shift_times, 'linear', 'extrap');
+pred_shift_lookahead = interp1(time, a_lat_lookahead_vec, predictive_shift_times, 'linear', 'extrap');
+pred_shift_thresh    = interp1(time, lat_thresh_vec, predictive_shift_times, 'linear', 'extrap');
+
+% --- 1: Current lateral acceleration
+subplot(2,1,1); hold on;
+plot(time_uniform, a_lat_plot, 'b-');
+plot(predictive_shift_times, pred_shift_lat, 'rv', 'MarkerFaceColor', 'r');
+ylabel('a_{lat} [m/s²]');
+title('Current Lateral Acceleration');
+grid on;
+
+% --- 2: Lookahead a_lat and threshold overlaid
+subplot(2,1,2); hold on;
+plot(time_uniform, a_lat_lookahead_plot, 'm-', 'DisplayName', 'Lookahead a_{lat}');
+plot(time_uniform, lat_thresh_plot, 'k--', 'DisplayName', 'a_{lat} Threshold');
+plot(predictive_shift_times, pred_shift_lookahead, 'rv', 'MarkerSize', 6, ...
+    'MarkerFaceColor', 'r', 'DisplayName', 'Predictive Shift');
+ylabel('a_{lat} [m/s²]');
+xlabel('Time [s]');
+title('Lookahead Lateral Acceleration and Threshold');
+legend('Location', 'best');
+grid on;
+
+
 
 
 
