@@ -66,6 +66,8 @@ min_time_between_shifts = 2.0;  % seconds, minimum time between gear shifts
 time_since_last_shift = Inf;  % initialize to large so first shift can happen
 predictive_shift_times = [];  % stores times when predictive shifts occur
 verbose = true;   % Set to false to disable debug printouts
+lat_lockout_thresh = 6.0;  % [m/s^2] — lock out shifting above this lateral acceleration
+
 
 
 
@@ -122,28 +124,19 @@ for i = 1:N-1
     throttle_vec(i) = throttle;
     brake_vec(i) = brake;
 
-    % % ///////PASSIVE////////
-    % % Predict next RPM
-    % next_rpm = (v(i+1) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
-    % 
-    % % Compute lateral acceleration
-    % kappa_i = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
-    % a_lat(i) = v_target(i)^2 * kappa_i;
-    % 
-    % % Passive Gearshifting logic inline
-    % if abs(a_lat(i)) > lat_thresh
-    %     gear(i+1) = current_gear;
-    % else
-    %     skip_upshift = throttle < 0.3;
-    %     if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear) && ~skip_upshift
-    %         gear(i+1) = current_gear + 1;
-    %     elseif current_gear > 1 && next_rpm < downshift_rpm_thresh(current_gear)
-    %         gear(i+1) = current_gear - 1;
-    %     else
-    %         gear(i+1) = current_gear;
-    %     end
-    % end
-    % % % ///////PASSIVE////////
+    [a_lat(i), ~] = compute_lateral_accel(s(i), v(i), raceline_distance, raceline_kappa_radpm);
+
+    lat_thresh_vec(i) = lat_thresh;
+    a_lat_lookahead_vec(i) = lat_avg;
+
+    % === Lock out all shifting if current lateral acceleration is too high ===
+    if abs(a_lat(i)) > lat_lockout_thresh
+        gear(i+1) = current_gear;
+        if verbose
+            fprintf("Shift locked at t=%.2f — a_lat = %.2f > %.2f\n", time(i), abs(a_lat(i)), lat_lockout_thresh);
+        end
+        continue;  % Skip predictive + passive shifting
+    end
 
     % /////////PREDICTIVE//////////
     t_lookahead        = 0.9;      % seconds, lookahead horizon
@@ -152,86 +145,30 @@ for i = 1:N-1
     min_lat_thresh     = 2.0;      % maximum threshold at low speed
     scale_factor       = 0.0015;   % units: (m/s)^2 to m/s²
 
-    % === Block shifting under high current lateral load ===
-    kappa_now = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
-    a_lat_now = v(i)^2 * kappa_now;
-    a_lat(i) = a_lat_now;  % <-- Always store a_lat
-    
-    if abs(a_lat_now) > 6
-        gear(i+1) = current_gear;
-        if verbose
-            fprintf("Locked at t=%.2f — current lateral accel too high (%.2f > 5.00)\n", ...
-                time(i), abs(a_lat_now));
-        end
-        continue;
-    end
-
     % Predict lookahead conditions
     s_lookahead = s(i) + v(i) * t_lookahead;
     v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
     kappa_lookahead = interp1(raceline_distance, raceline_kappa_radpm, s_lookahead, 'linear', 'extrap');
     future_rpm = (v_lookahead * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
 
-    % === Predictive Gearshift Logic ===
-    lat_thresh = min_lat_thresh + scale_factor * v_lookahead^2;
-    lat_thresh_vec(i) = lat_thresh;
-    predictive_shift_flag = false;
+    [a_lat(i), ~] = compute_lateral_accel(s(i), v(i), raceline_distance, raceline_kappa_radpm);  % store current a_lat
     
-    % === Always compute lateral acceleration window ===
-    t_eval = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
-    a_lat_window = zeros(size(t_eval));
+    [next_gear, pred_flag, lat_thresh, lat_avg] = predictive_shift_logic(i, s, v, gear, ...
+        time_since_last_shift, raceline_distance, raceline_speed, raceline_kappa_radpm, ...
+        gear_ratios, downshift_rpm_thresh, t_lookahead, t_shift_window, dt_lookahead, ...
+        min_lat_thresh, scale_factor, final_drive, wheel_radius);
     
-    for j = 1:length(t_eval)
-        s_eval = s(i) + v(i) * t_eval(j);
-        v_eval = interp1(raceline_distance, raceline_speed, s_eval, 'linear', 'extrap');
-        kappa_eval = interp1(raceline_distance, raceline_kappa_radpm, s_eval, 'linear', 'extrap');
-        a_lat_window(j) = v_eval^2 * kappa_eval;
-    end
     
-    % Store the mean for plotting
-    a_lat_lookahead_vec(i) = mean(abs(a_lat_window));
-    
-    % === Step 2: Evaluate conditions
-    do_downshift = ...
-        current_gear > 1 && ...
-        future_rpm < downshift_rpm_thresh(current_gear) && ...
-        time_since_last_shift >= min_time_between_shifts;
-    
-    lat_ok = all(abs(a_lat_window) > lat_thresh);
-    
-    % === Step 3: Trigger predictive shift if all criteria met
-    if do_downshift && lat_ok
-        gear(i+1) = current_gear - 1;
-        predictive_shift_flag = true;
-        time_since_last_shift = 0;
+    if pred_flag
+        gear(i+1) = next_gear;
         predictive_shift_times(end+1) = time(i);
-    
-        % Debug
-        fprintf("Predictive shift at t=%.2f | gear=%d → %d | rpm=%.0f | lat_thresh=%.2f | min_window=%.2f\n", ...
-            time(i), current_gear, current_gear - 1, future_rpm, lat_thresh, min(abs(a_lat_window)));
+        time_since_last_shift = 0;
     else
-        gear(i+1) = current_gear;
+        % Fallback: Passive logic
+        next_rpm = compute_rpm(v(i+1), gear_ratio, final_drive, wheel_radius);
     
-        % Optional: print why it didn't happen
-        if do_downshift && ~lat_ok
-            fprintf("Blocked at t=%.2f — lateral window didn't clear threshold (min=%.2f < %.2f)\n", ...
-                time(i), min(abs(a_lat_window)), lat_thresh);
-        end
-    end
-
-
-    if ~predictive_shift_flag
-        % Predict next RPM at next timestep
-        next_rpm = (v(i+1) * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
-    
-        % Compute lateral acceleration now
-        kappa_i = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
-        % a_lat(i) = v_target(i)^2 * kappa_i;
-    
-        % Passive shifting logic with time gating
         if abs(a_lat(i)) > lat_thresh || time_since_last_shift < min_time_between_shifts
             gear(i+1) = current_gear;
-            a_lat(i) = v_target(i)^2 * kappa_i;
         else
             skip_upshift = throttle < 0.3;
             if current_gear < max_gear && next_rpm > upshift_rpm_thresh(current_gear) && ~skip_upshift
@@ -245,12 +182,7 @@ for i = 1:N-1
             end
         end
     end
-
-
-    %//////////PREDICTIVE/////////////
-
-
-
+    %//////////PREDICTIVE////////////
 end
 
 sim_length = i;
@@ -558,3 +490,57 @@ function [v_target_i, a_cmd, throttle, brake] = velocity_control(s_i, v_i, racel
 
 end
 
+function [next_gear, predictive_shift_flag, lat_thresh_out, lat_lookahead_avg] = ...
+    predictive_shift_logic(i, s, v, gear, time_since_last_shift, ...
+    raceline_distance, raceline_speed, raceline_kappa_radpm, ...
+    gear_ratios, downshift_rpm_thresh, t_lookahead, t_shift_window, ...
+    dt_lookahead, min_lat_thresh, scale_factor, final_drive, wheel_radius)
+
+    current_gear = gear(i);
+    gear_ratio = gear_ratios(current_gear);
+    next_gear = current_gear;
+    predictive_shift_flag = false;
+
+    kappa_now = interp1(raceline_distance, raceline_kappa_radpm, s(i), 'linear', 'extrap');
+    a_lat_now = v(i)^2 * kappa_now;
+    lat_thresh_out = NaN;
+    lat_lookahead_avg = NaN;
+
+    if abs(a_lat_now) > 6
+        return  % Skip shift logic
+    end
+
+    s_lookahead = s(i) + v(i) * t_lookahead;
+    v_lookahead = interp1(raceline_distance, raceline_speed, s_lookahead, 'linear', 'extrap');
+    future_rpm = (v_lookahead * 60 / (2 * pi * wheel_radius)) * gear_ratio * final_drive;
+
+    lat_thresh_out = min_lat_thresh + scale_factor * v_lookahead^2;
+
+    % Compute lateral acceleration window
+    t_eval = t_lookahead : dt_lookahead : (t_lookahead + t_shift_window);
+    a_lat_window = zeros(size(t_eval));
+
+    for j = 1:length(t_eval)
+        s_eval = s(i) + v(i) * t_eval(j);
+        v_eval = interp1(raceline_distance, raceline_speed, s_eval, 'linear', 'extrap');
+        kappa_eval = interp1(raceline_distance, raceline_kappa_radpm, s_eval, 'linear', 'extrap');
+        a_lat_window(j) = v_eval^2 * kappa_eval;
+    end
+
+    lat_lookahead_avg = mean(abs(a_lat_window));
+    lat_ok = all(abs(a_lat_window) > lat_thresh_out);
+
+    do_downshift = current_gear > 1 && ...
+                   future_rpm < downshift_rpm_thresh(current_gear) && ...
+                   time_since_last_shift >= 2.0;
+
+    if do_downshift && lat_ok
+        next_gear = current_gear - 1;
+        predictive_shift_flag = true;
+    end
+end
+
+function [a_lat_val, kappa_val] = compute_lateral_accel(s_i, v_i, raceline_distance, raceline_kappa)
+    kappa_val = interp1(raceline_distance, raceline_kappa, s_i, 'linear', 'extrap');
+    a_lat_val = v_i^2 * kappa_val;
+end
