@@ -125,10 +125,6 @@ for i = 1:N-1
     brake_vec(i) = brake;
 
     [a_lat(i), ~] = compute_lateral_accel(s(i), v(i), raceline_distance, raceline_kappa_radpm);
-
-    lat_thresh_vec(i) = lat_thresh;
-    a_lat_lookahead_vec(i) = lat_avg;
-
     % === Lock out all shifting if current lateral acceleration is too high ===
     if abs(a_lat(i)) > lat_lockout_thresh
         gear(i+1) = current_gear;
@@ -157,6 +153,11 @@ for i = 1:N-1
         time_since_last_shift, raceline_distance, raceline_speed, raceline_kappa_radpm, ...
         gear_ratios, downshift_rpm_thresh, t_lookahead, t_shift_window, dt_lookahead, ...
         min_lat_thresh, scale_factor, final_drive, wheel_radius);
+
+
+    lat_thresh_vec(i) = lat_thresh;
+    a_lat_lookahead_vec(i) = lat_avg;
+
     
     
     if pred_flag
